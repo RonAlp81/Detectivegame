@@ -1,12 +1,36 @@
-const { useReducer } = React;
+const { useReducer, useState } = React;
 
 const START_REPUTATION = 70;
-const REPUTATION_COST_PER_ACTION = 1; // every evidence check / interview costs a little credibility
+const REPUTATION_COST_PER_ACTION = 1; // every evidence check / interview action costs a little credibility
 const REPUTATION_REWARD_CORRECT = 20;
 const REPUTATION_PENALTY_WRONG = 30;
+const QUESTION_HOURS_COST = 1; // every free-text question asked after the interview has started
 
 function clampReputation(value) {
   return Math.max(0, Math.min(100, value));
+}
+
+// Scores every topic on a suspect by how many of its keywords appear in the
+// player's free-text question, and returns the best match's answer, or the
+// suspect's deflect line if nothing scores above zero.
+function matchSuspectTopic(suspect, questionRaw) {
+  const normalized = questionRaw.trim().replace(/[?.,!"'׳״]/g, "");
+  if (!normalized) return null;
+
+  let bestTopic = null;
+  let bestScore = 0;
+  suspect.topics.forEach((topic) => {
+    const score = topic.keywords.reduce(
+      (acc, kw) => acc + (normalized.includes(kw) ? 1 : 0),
+      0
+    );
+    if (score > bestScore) {
+      bestScore = score;
+      bestTopic = topic;
+    }
+  });
+
+  return bestTopic ? bestTopic.answer : suspect.deflect;
 }
 
 function createInitialState(activeCase) {
@@ -15,7 +39,7 @@ function createInitialState(activeCase) {
     hoursElapsed: 0,
     reputation: START_REPUTATION,
     examinedEvidence: {},
-    interviewedSuspects: {},
+    interviews: {}, // suspectId -> { started: bool, transcript: [{q, a}] }
     selectedSuspectId: null,
     confirming: false,
     finished: false,
@@ -34,13 +58,32 @@ function reducer(state, action) {
         reputation: clampReputation(state.reputation - REPUTATION_COST_PER_ACTION),
       };
     }
-    case "INTERVIEW_SUSPECT": {
-      if (state.finished || state.interviewedSuspects[action.id]) return state;
+    case "START_INTERVIEW": {
+      if (state.finished || state.interviews[action.id]) return state;
       return {
         ...state,
-        interviewedSuspects: { ...state.interviewedSuspects, [action.id]: true },
+        interviews: {
+          ...state.interviews,
+          [action.id]: { started: true, transcript: [] },
+        },
         hoursElapsed: state.hoursElapsed + action.hoursCost,
         reputation: clampReputation(state.reputation - REPUTATION_COST_PER_ACTION),
+      };
+    }
+    case "ASK_QUESTION": {
+      if (state.finished) return state;
+      const existing = state.interviews[action.id];
+      if (!existing || !existing.started) return state;
+      return {
+        ...state,
+        interviews: {
+          ...state.interviews,
+          [action.id]: {
+            ...existing,
+            transcript: [...existing.transcript, { q: action.question, a: action.answer }],
+          },
+        },
+        hoursElapsed: state.hoursElapsed + QUESTION_HOURS_COST,
       };
     }
     case "SELECT_SUSPECT":
@@ -113,21 +156,77 @@ function EvidenceCard({ evidence, examined, onExamine }) {
   );
 }
 
-function SuspectCard({ suspect, interviewed, selected, disabled, onInterview, onSelect }) {
+function InterviewPanel({ suspect, interview, disabled, onAskQuestion }) {
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState("");
+
+  const handleAsk = () => {
+    const trimmed = draft.trim();
+    if (!trimmed) {
+      setError("כתבו שאלה קודם.");
+      return;
+    }
+    setError("");
+    const answer = matchSuspectTopic(suspect, trimmed);
+    onAskQuestion(suspect, trimmed, answer);
+    setDraft("");
+  };
+
   return (
-    <li className={`case-card suspect-card${interviewed ? " is-open" : ""}${selected ? " is-selected" : ""}`}>
+    <div className="interview-panel">
+      <div className="interview-transcript">
+        <p className="interview-bubble interview-bubble-suspect">{suspect.opening}</p>
+        {interview.transcript.map((turn, idx) => (
+          <React.Fragment key={idx}>
+            <p className="interview-bubble interview-bubble-you">{turn.q}</p>
+            <p className="interview-bubble interview-bubble-suspect">{turn.a}</p>
+          </React.Fragment>
+        ))}
+      </div>
+      <div className="interview-input-row">
+        <input
+          type="text"
+          className="interview-input"
+          placeholder="לדוגמה: איפה היית באותו ערב?"
+          value={draft}
+          disabled={disabled}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            if (error) setError("");
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") handleAsk();
+          }}
+        />
+        <button type="button" className="btn btn-outline btn-ask" disabled={disabled} onClick={handleAsk}>
+          שאל/י ({QUESTION_HOURS_COST} שעה)
+        </button>
+      </div>
+      {error && <p className="interview-error">{error}</p>}
+    </div>
+  );
+}
+
+function SuspectCard({ suspect, interview, selected, disabled, onStartInterview, onAskQuestion, onSelect }) {
+  return (
+    <li className={`case-card suspect-card${interview ? " is-open" : ""}${selected ? " is-selected" : ""}`}>
       <div className="case-card-head">
         <span className="case-card-icon" aria-hidden="true">🕵️</span>
         <span className="case-card-title">{suspect.name}</span>
         <span className="suspect-role">{suspect.role}</span>
       </div>
       <p className="case-card-summary">{suspect.profile}</p>
-      {!interviewed ? (
-        <button type="button" className="btn btn-outline" onClick={() => onInterview(suspect)}>
-          חקירת חשוד ({suspect.hoursCost} שעות)
+      {!interview ? (
+        <button type="button" className="btn btn-outline" onClick={() => onStartInterview(suspect)}>
+          התחלת חקירה ({suspect.hoursCost} שעות)
         </button>
       ) : (
-        <p className="case-card-details">{suspect.interview}</p>
+        <InterviewPanel
+          suspect={suspect}
+          interview={interview}
+          disabled={disabled}
+          onAskQuestion={onAskQuestion}
+        />
       )}
       <button
         type="button"
@@ -158,7 +257,7 @@ function ConfirmDialog({ suspectName, onConfirm, onCancel }) {
   );
 }
 
-function ResultOverlay({ outcome, verdict, hoursElapsed, reputation, onReset }) {
+function ResultOverlay({ outcome, verdict, hoursElapsed, reputation, onPlayAgain, onBackToCases }) {
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true">
       <div className={`modal-box result-box tone-${outcome === "correct" ? "good" : "bad"}`}>
@@ -168,22 +267,26 @@ function ResultOverlay({ outcome, verdict, hoursElapsed, reputation, onReset }) 
           <span>זמן חקירה כולל: {formatElapsedTime(hoursElapsed)}</span>
           <span>מוניטין סופי: {reputation}/100</span>
         </div>
-        <button type="button" className="btn btn-primary" onClick={onReset}>
-          חקירה חדשה
-        </button>
+        <div className="modal-actions">
+          <button type="button" className="btn btn-ghost" onClick={onPlayAgain}>לנסות תיק זה שוב</button>
+          <button type="button" className="btn btn-primary" onClick={onBackToCases}>חזרה לרשימת התיקים</button>
+        </div>
       </div>
     </div>
   );
 }
 
-function DetectiveGame({ activeCase }) {
+function DetectiveGame({ activeCase, onBackToCases }) {
   const [state, dispatch] = useReducer(reducer, activeCase, createInitialState);
 
   const handleExamine = (evidence) =>
     dispatch({ type: "EXAMINE_EVIDENCE", id: evidence.id, hoursCost: evidence.hoursCost });
 
-  const handleInterview = (suspect) =>
-    dispatch({ type: "INTERVIEW_SUSPECT", id: suspect.id, hoursCost: suspect.hoursCost });
+  const handleStartInterview = (suspect) =>
+    dispatch({ type: "START_INTERVIEW", id: suspect.id, hoursCost: suspect.hoursCost });
+
+  const handleAskQuestion = (suspect, question, answer) =>
+    dispatch({ type: "ASK_QUESTION", id: suspect.id, question, answer });
 
   const handleSelectSuspect = (id) => dispatch({ type: "SELECT_SUSPECT", id });
 
@@ -192,6 +295,12 @@ function DetectiveGame({ activeCase }) {
   return (
     <div className="detective-app">
       <header className="case-header">
+        <div className="case-header-top">
+          <span className="difficulty-badge">{activeCase.difficulty}</span>
+          <button type="button" className="btn btn-ghost btn-small" onClick={onBackToCases}>
+            רשימת התיקים
+          </button>
+        </div>
         <h1>{activeCase.title}</h1>
         <p>{activeCase.description}</p>
       </header>
@@ -220,10 +329,11 @@ function DetectiveGame({ activeCase }) {
               <SuspectCard
                 key={suspect.id}
                 suspect={suspect}
-                interviewed={!!state.interviewedSuspects[suspect.id]}
+                interview={state.interviews[suspect.id]}
                 selected={state.selectedSuspectId === suspect.id}
                 disabled={state.finished}
-                onInterview={handleInterview}
+                onStartInterview={handleStartInterview}
+                onAskQuestion={handleAskQuestion}
                 onSelect={handleSelectSuspect}
               />
             ))}
@@ -257,12 +367,55 @@ function DetectiveGame({ activeCase }) {
           verdict={activeCase.verdict}
           hoursElapsed={state.hoursElapsed}
           reputation={state.reputation}
-          onReset={() => dispatch({ type: "RESET", activeCase })}
+          onPlayAgain={() => dispatch({ type: "RESET", activeCase })}
+          onBackToCases={onBackToCases}
         />
       )}
     </div>
   );
 }
 
-const activeCase = window.DETECTIVE_CASES[0];
-ReactDOM.createRoot(document.getElementById("root")).render(<DetectiveGame activeCase={activeCase} />);
+function CaseSelectScreen({ cases, onSelect }) {
+  return (
+    <div className="detective-app">
+      <header className="case-header">
+        <h1>תיקים פתוחים</h1>
+        <p>בחר/י תיק להתחיל בחקירה. ככל שהתיק קשה יותר, כך יש יותר חשודים וראיות עמומות יותר.</p>
+      </header>
+      <ul className="case-select-list">
+        {cases.map((c) => (
+          <li key={c.id} className="case-card case-select-card">
+            <div className="case-card-head">
+              <span className="difficulty-badge">{c.difficulty}</span>
+              <span className="case-card-title">{c.title}</span>
+            </div>
+            <p className="case-card-summary">{c.description}</p>
+            <button type="button" className="btn btn-primary" onClick={() => onSelect(c.id)}>
+              פתיחת התיק
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function App() {
+  const cases = window.DETECTIVE_CASES;
+  const [selectedCaseId, setSelectedCaseId] = useState(null);
+
+  if (!selectedCaseId) {
+    return <CaseSelectScreen cases={cases} onSelect={setSelectedCaseId} />;
+  }
+
+  const activeCase = cases.find((c) => c.id === selectedCaseId);
+  return (
+    <DetectiveGame
+      key={activeCase.id}
+      activeCase={activeCase}
+      onBackToCases={() => setSelectedCaseId(null)}
+    />
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);

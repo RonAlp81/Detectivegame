@@ -10,20 +10,65 @@ function clampReputation(value) {
   return Math.max(0, Math.min(100, value));
 }
 
-// Scores every topic on a suspect by how many of its keywords appear in the
-// player's free-text question, and returns the best match's answer, or the
+// Splits text into word tokens, stripping punctuation but keeping Hebrew
+// letters, latin letters and digits (so "VPN", "23:47" etc. still tokenize).
+function tokenizeWords(text) {
+  return text
+    .replace(/[?!.,"'׳״():;]/g, " ")
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+// Hebrew attaches single-letter prefixes (ה, ו, ב, כ, ל, מ, ש) to words, and
+// verbs conjugate heavily (e.g. "היית" vs "היתה" vs "הייתם"). Stripping up to
+// two leading prefix letters and then comparing by substring containment
+// (rather than exact match) lets "שהייתה" match a keyword like "היית" even
+// though the surface forms differ.
+function stripHebrewPrefixes(token) {
+  if (!/^[\u0590-\u05FF]+$/.test(token)) return token;
+  let w = token;
+  for (let i = 0; i < 2; i++) {
+    if (w.length > 3 && "לבכמושה".includes(w[0])) {
+      w = w.slice(1);
+    } else {
+      break;
+    }
+  }
+  return w;
+}
+
+function wordsRoughlyMatch(a, b) {
+  if (a === b) return true;
+  if (a.length >= 3 && b.length >= 3) return a.includes(b) || b.includes(a);
+  return false;
+}
+
+// Scores every topic on a suspect by how many of its keyword phrases are
+// present in the player's free-text question, matching at the word level
+// (with prefix-stripping and substring fuzziness) instead of requiring the
+// exact phrase to appear verbatim. Returns the best match's answer, or the
 // suspect's deflect line if nothing scores above zero.
 function matchSuspectTopic(suspect, questionRaw) {
-  const normalized = questionRaw.trim().replace(/[?.,!"'׳״]/g, "");
-  if (!normalized) return null;
+  const trimmed = questionRaw.trim();
+  if (!trimmed) return null;
+
+  const qTokens = tokenizeWords(trimmed).map(stripHebrewPrefixes);
 
   let bestTopic = null;
   let bestScore = 0;
   suspect.topics.forEach((topic) => {
-    const score = topic.keywords.reduce(
-      (acc, kw) => acc + (normalized.includes(kw) ? 1 : 0),
-      0
-    );
+    let score = 0;
+    topic.keywords.forEach((kwPhrase) => {
+      const kwTokens = tokenizeWords(kwPhrase).map(stripHebrewPrefixes);
+      const matchedCount = kwTokens.filter((kwt) =>
+        qTokens.some((qt) => wordsRoughlyMatch(qt, kwt))
+      ).length;
+      // Single-word keywords need one hit; multi-word phrases need at least
+      // half their words to show up, so partial/rephrased questions still count.
+      const threshold = kwTokens.length <= 1 ? 1 : Math.ceil(kwTokens.length / 2);
+      if (matchedCount >= threshold) score += 1;
+    });
     if (score > bestScore) {
       bestScore = score;
       bestTopic = topic;
